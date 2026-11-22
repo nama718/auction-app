@@ -2,18 +2,19 @@
 """
 eval_tests.py - Automated evaluation of the auction server.
 
-Three groups of tests (these map to the "Evaluations" section of the report):
+Four groups of tests (these map to the "Evaluations" section of the report):
   1. FUNCTIONALITY - normal bidding works end to end.
   2. ROBUSTNESS    - crashes, garbage input and oversized messages do not hurt
                      the server or the other clients.
-  3. LOAD          - N simulated bidders hammer one item at once; we check
+  3. AUCTIONEER    - the seller role: listing items, the queue, and its rules.
+  4. LOAD          - N simulated bidders hammer one item at once; we check
                      correctness invariants and measure latency.
 
 The server is started as a SEPARATE PROCESS (like in real use) so the numbers
 are not distorted by sharing Python's GIL with the test bots.
 
 USAGE
-    python3 eval_tests.py              # everything (about 40 s)
+    python3 eval_tests.py              # everything (about 60 s)
     python3 eval_tests.py --quick      # smaller load test
 Results are printed and saved to results.json.
 """
@@ -79,10 +80,10 @@ class ServerProc:
 class Probe:
     """A client that records every message so tests can wait for specific ones."""
 
-    def __init__(self, port, nick):
+    def __init__(self, port, nick, role="bidder"):
         self.msgs = []
         self.cv = threading.Condition()
-        self.client = AuctionClient("127.0.0.1", port, nick, self._on_msg)
+        self.client = AuctionClient("127.0.0.1", port, nick, self._on_msg, role)
         self.client.connect()
 
     def _on_msg(self, msg, _t):
@@ -200,7 +201,80 @@ def test_robustness():
             p.client.close()
 
 
-# -------------------------------------------------------------------- 3. LOAD
+# ---------------------------------------------------------------- 3. AUCTIONEER
+def test_auctioneer():
+    print("\n== 3. Auctioneer role ==")
+    # min_clients=2: the built-in item waits in the queue until two bidders are in,
+    # which gives us time to list an item behind it.
+    with ServerProc("House Item:10", duration=3, min_clients=2) as s:
+        carol = Probe(s.port, "carol", "auctioneer")
+        w = carol.wait_type("welcome")
+        check("auctioneer joins and is told its role", w is not None and w["role"] == "auctioneer")
+        alice = Probe(s.port, "alice")
+        w = alice.wait_type("welcome")
+        check("default role is bidder", w is not None and w["role"] == "bidder")
+        mallory = Probe(s.port, "mallory", "hacker")
+        check("unknown role is refused", mallory.wait_type("error", code="invalid_role") is not None)
+
+        carol.client.list_item("Antique Lamp", 20, 5, req_id=1)
+        ok = carol.wait_type("item_listed", id=1)
+        check("auctioneer can list an item (queued behind the default one)",
+              ok is not None and ok["position"] == 2)
+        q = alice.wait(lambda m: m.get("type") == "queue" and len(m["items"]) == 2)
+        check("everyone is told about the updated queue",
+              q is not None and q["items"][1]["item"] == "Antique Lamp" and q["items"][1]["seller"] == "carol")
+
+        alice.client.send({"type": "list_item", "name": "Sneaky", "start_price": 5, "id": 2})
+        rej = alice.wait_type("list_rejected", id=2)
+        check("a bidder cannot list items", rej is not None and rej["reason"] == "not_auctioneer")
+
+        bad = [("", 5, 10), ("x" * 41, 5, 10), ("Ok", -5, 10), ("Ok", 1.5, 10),
+               ("Ok", True, 10), ("Ok", 5, 1), ("Ok", 5, 9999), (123, 5, 10)]
+        for i, (n, p, d) in enumerate(bad, start=10):
+            carol.client.list_item(n, p, d, req_id=i)
+        results = [carol.wait_type("list_rejected", id=i) for i in range(10, 10 + len(bad))]
+        check("invalid listings (name, price, duration) are rejected",
+              all(r and r["reason"] == "invalid_item" for r in results))
+
+        bob = Probe(s.port, "bob")  # second bidder: the default item can start now
+        st = alice.wait_type("item_start", item="House Item")
+        check("default item still runs when nobody lists first (seller is null)",
+              st is not None and st["seller"] is None)
+        carol.client.bid(50, 3)
+        rej = carol.wait_type("bid_rejected", id=3)
+        check("an auctioneer cannot bid", rej is not None and rej["reason"] == "auctioneer_cannot_bid")
+
+        st = alice.wait_type("item_start", item="Antique Lamp", timeout=8)
+        check("listed item starts next with its seller, price and own duration",
+              st is not None and st["seller"] == "carol" and st["start_price"] == 20 and st["ends_in"] == 5)
+        alice.client.bid(20, 4)
+        check("bidders can bid on a listed item", alice.wait_type("bid_accepted", id=4) is not None)
+
+        # While the Lamp runs the queue is empty, so exactly MAX_QUEUE of 25 fit.
+        for i in range(25):
+            carol.client.list_item(f"Spam{i}", 5, req_id=100 + i)
+        outcomes = [carol.wait(lambda m, i=i: m.get("id") == 100 + i
+                               and m.get("type") in ("item_listed", "list_rejected"))
+                    for i in range(25)]
+        listed = sum(1 for o in outcomes if o and o["type"] == "item_listed")
+        full = sum(1 for o in outcomes if o and o.get("reason") == "queue_full")
+        check("queue is capped (20 accepted, 5 told queue_full)", listed == 20 and full == 5)
+
+        end = bob.wait_type("auction_end", item="Antique Lamp", timeout=10)
+        check("auction_end names the seller, winner and price",
+              end is not None and end["seller"] == "carol" and end["winner"] == "alice" and end["amount"] == 20)
+        check("server still alive", s.alive())
+        for p in (alice, bob, carol):
+            p.client.close()
+
+    with ServerProc("Solo:5", duration=2, pause=0.2) as s:
+        a = Probe(s.port, "alice")
+        check("without auctioneers the session still ends with all_done",
+              a.wait_type("all_done", timeout=8) is not None)
+        a.client.close()
+
+
+# -------------------------------------------------------------------- 4. LOAD
 class Bot:
     """A simulated bidder that bids aggressively as soon as the item starts."""
 
@@ -267,7 +341,7 @@ def pct(values, p):
 
 
 def load_test(n_bots, duration):
-    print(f"\n== 3. Load test: {n_bots} concurrent bidders, {duration}s ==")
+    print(f"\n== 4. Load test: {n_bots} concurrent bidders, {duration}s ==")
     with ServerProc("Load Item:1", duration=duration, min_clients=n_bots) as s:
         bots = [Bot(s.port, i) for i in range(n_bots)]
         for b in bots:
@@ -317,6 +391,7 @@ def main():
 
     test_functionality()
     test_robustness()
+    test_auctioneer()
     sizes = [(10, 5)] if args.quick else [(10, 8), (25, 8), (50, 8)]
     load = [load_test(n, d) for n, d in sizes]
 

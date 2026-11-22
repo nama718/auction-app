@@ -13,6 +13,9 @@ WHY THIS DESIGN
       gives us reliable, in-order delivery for free.
     * One thread per client for reading, one for writing: a slow or dead client
       can never block the other clients (see ClientConn).
+    * Two roles: a BIDDER bids; an AUCTIONEER lists items for sale (and cannot
+      bid, so nobody can ever bid on their own item). Listed items join a FIFO
+      queue behind the built-in default items.
     * ONE global lock around auction state: two clients can bid at the same
       instant; the lock turns "simultaneous" into "one after the other", so
       exactly one of them wins and the order is the same for everybody.
@@ -24,21 +27,27 @@ APPLICATION-LAYER PROTOCOL
     receiver buffers bytes and splits on "\\n" to recover message boundaries.
 
     Client -> Server
-        {"type":"join",   "nick":"alice"}
+        {"type":"join",   "nick":"alice", "role":"bidder" | "auctioneer"}
+        {"type":"list_item", "name":"Lamp", "start_price":20, "duration":30, "id":1}
         {"type":"bid",    "amount":120, "id":7, "client_ts":1712345678.1}
         {"type":"status"}
         {"type":"leave"}
     Server -> Client
-        {"type":"welcome",      "nick":"alice", "users":["alice","bob"]}
-        {"type":"item_start",   "item":"Watch", "start_price":50, "ends_in":30.0}
+        {"type":"welcome",      "nick":"alice", "role":"bidder", "users":["alice","bob"],
+                                "auctioneers":["carol"]}
+        {"type":"item_start",   "item":"Watch", "start_price":50, "ends_in":30.0,
+                                "seller":"carol" | null}
+        {"type":"item_listed",  "id":1, "item":"Lamp", "position":2}
+        {"type":"list_rejected","id":1, "reason":"not_auctioneer" | "invalid_item" | ...}
+        {"type":"queue",        "items":[{"item":"Lamp","start_price":20,"seller":"carol"}]}
         {"type":"state",        "item":..., "high_bid":..., "high_bidder":..., "ends_in":...}
         {"type":"bid_accepted", "id":7, "amount":120, "seq":3}
         {"type":"bid_rejected", "id":7, "reason":"too_low", "minimum":121}
         {"type":"new_high_bid", "nick":"bob", "amount":125, "seq":4, "ends_in":12.3,
                                 "client_ts":...}
         {"type":"auction_end",  "item":"Watch", "winner":"bob", "amount":125,
-                                "accepted_bids":4}
-        {"type":"user_joined" | "user_left", "nick":"..."}
+                                "accepted_bids":4, "seller":"carol" | null}
+        {"type":"user_joined" | "user_left", "nick":"...", "role":"..."}
         {"type":"all_done",     "results":[...]}
         {"type":"error",        "code":"bad_json" | "join_first" | ...}
 
@@ -47,6 +56,7 @@ USAGE
 """
 
 import argparse
+import collections
 import json
 import queue
 import re
@@ -71,6 +81,13 @@ OUTQ_MAX = 500
 # extensions is capped so the auction is guaranteed to finish.
 MAX_EXTENSIONS = 3
 
+ROLES = ("bidder", "auctioneer")
+
+# Limits for items listed by auctioneers (so one user cannot flood the queue).
+MAX_QUEUE = 20
+MAX_ITEM_NAME = 40
+MIN_DURATION, MAX_DURATION = 5, 300
+
 
 def log(text):
     """Timestamped, flushed print so logs appear immediately when piped."""
@@ -92,6 +109,7 @@ class ClientConn:
         self.sock = sock
         self.addr = addr
         self.nick = None  # None until the client has sent a valid "join"
+        self.role = "bidder"
         self.outq = queue.Queue(maxsize=OUTQ_MAX)
         self.closed = False
         self.closing = False  # True once a graceful close was requested
@@ -163,7 +181,11 @@ class AuctionServer:
                  min_increment, min_clients, anti_snipe):
         self.host = host
         self.port = port
-        self.items = items              # list of (name, starting_price)
+        # FIFO queue of items waiting to be auctioned. Default items are put in
+        # first (seller=None); auctioneers append more while the server runs.
+        self.queue = collections.deque(
+            {"name": n, "start_price": p, "duration": duration, "seller": None}
+            for n, p in items)
         self.duration = duration        # seconds per item
         self.pause = pause              # seconds between items
         self.min_increment = min_increment
@@ -252,7 +274,8 @@ class AuctionServer:
             if conn.nick and self.clients.get(conn.nick) is conn:
                 del self.clients[conn.nick]
                 log(f"{conn.nick} disconnected")
-                self._broadcast_locked({"type": "user_left", "nick": conn.nick})
+                self._broadcast_locked({"type": "user_left", "nick": conn.nick,
+                                        "role": conn.role})
             # Note: if conn was the high bidder, their bid STANDS. Bids are
             # commitments; disconnecting is not a way to take a bid back.
 
@@ -275,6 +298,8 @@ class AuctionServer:
                 conn.send({"type": "error", "code": "join_first"})
         elif mtype == "bid":
             self._do_bid(conn, msg)
+        elif mtype == "list_item":
+            self._do_list_item(conn, msg)
         elif mtype == "status":
             with self.lock:
                 self._send_state_locked(conn)
@@ -290,16 +315,57 @@ class AuctionServer:
         if not isinstance(nick, str) or not NICK_RE.match(nick):
             conn.send({"type": "error", "code": "invalid_nick"})
             return
+        role = msg.get("role", "bidder")  # old clients send no role: bidder
+        if role not in ROLES:
+            conn.send({"type": "error", "code": "invalid_role"})
+            return
         with self.lock:
             if nick in self.clients:  # check + insert must be atomic
                 conn.send({"type": "error", "code": "nick_taken"})
                 return
             self.clients[nick] = conn
             conn.nick = nick
-            log(f"{nick} joined from {conn.addr[0]}")
-            conn.send({"type": "welcome", "nick": nick, "users": sorted(self.clients)})
+            conn.role = role
+            log(f"{nick} joined as {role} from {conn.addr[0]}")
+            conn.send({"type": "welcome", "nick": nick, "role": role,
+                       "users": sorted(self.clients),
+                       "auctioneers": sorted(n for n, c in self.clients.items()
+                                             if c.role == "auctioneer")})
             self._send_state_locked(conn)  # late joiners see the running auction
-            self._broadcast_locked({"type": "user_joined", "nick": nick}, exclude=conn)
+            self._send_queue_locked(conn)
+            self._broadcast_locked({"type": "user_joined", "nick": nick, "role": role},
+                                   exclude=conn)
+
+    def _do_list_item(self, conn, msg):
+        """An auctioneer puts an item up for sale. It goes to the back of the queue."""
+        req_id = msg.get("id")
+        name, price, dur = msg.get("name"), msg.get("start_price"), msg.get("duration")
+        if conn.role != "auctioneer":
+            conn.send({"type": "list_rejected", "id": req_id, "reason": "not_auctioneer"})
+            return
+        dur_ok = dur is None or (not isinstance(dur, bool) and isinstance(dur, (int, float))
+                                 and MIN_DURATION <= dur <= MAX_DURATION)
+        if dur is None:
+            dur = self.duration  # the operator's setting is trusted, not range-checked
+        # bool is an int subclass in Python, so exclude it like in _do_bid.
+        # (NaN/Infinity fail the range check on duration, so they are rejected.)
+        if (not isinstance(name, str) or not (1 <= len(name.strip()) <= MAX_ITEM_NAME)
+                or not name.isprintable()
+                or isinstance(price, bool) or not isinstance(price, int)
+                or not (0 < price <= 10**9)
+                or not dur_ok):
+            conn.send({"type": "list_rejected", "id": req_id, "reason": "invalid_item"})
+            return
+        with self.lock:
+            if len(self.queue) >= MAX_QUEUE:
+                conn.send({"type": "list_rejected", "id": req_id, "reason": "queue_full"})
+                return
+            self.queue.append({"name": name.strip(), "start_price": price,
+                               "duration": dur, "seller": conn.nick})
+            log(f"{conn.nick} listed {name.strip()} (start {price}, {dur}s)")
+            conn.send({"type": "item_listed", "id": req_id, "item": name.strip(),
+                       "position": len(self.queue)})
+            self._broadcast_locked(self._queue_msg_locked())
 
     def _do_bid(self, conn, msg):
         amount = msg.get("amount")
@@ -307,6 +373,10 @@ class AuctionServer:
         # bool is a subclass of int in Python, so exclude it explicitly.
         if isinstance(amount, bool) or not isinstance(amount, int) or not (0 < amount <= 10**9):
             conn.send({"type": "bid_rejected", "id": bid_id, "reason": "invalid_amount"})
+            return
+
+        if conn.role == "auctioneer":  # auctioneers sell, they never bid
+            conn.send({"type": "bid_rejected", "id": bid_id, "reason": "auctioneer_cannot_bid"})
             return
 
         # ---- critical section --------------------------------------------
@@ -363,36 +433,59 @@ class AuctionServer:
             if c is not exclude:
                 c.send(msg)
 
+    def _queue_msg_locked(self):
+        return {"type": "queue",
+                "items": [{"item": i["name"], "start_price": i["start_price"],
+                           "seller": i["seller"]} for i in self.queue]}
+
+    def _send_queue_locked(self, conn):
+        conn.send(self._queue_msg_locked())
+
     def _send_state_locked(self, conn):
         cur = self.current
         if cur is None:
             conn.send({"type": "state", "item": None})
         else:
-            conn.send({"type": "state", "item": cur["item"], "start_price": cur["start_price"],
+            conn.send({"type": "state", "item": cur["item"], "seller": cur["seller"],
+                       "start_price": cur["start_price"],
                        "high_bid": cur["high_bid"], "high_bidder": cur["high_bidder"],
                        "ends_in": round(max(0.0, cur["ends_at"] - time.monotonic()), 2)})
 
     # ------------------------------------------------------------ auction timer
     def _auction_loop(self):
-        """Runs the items one after another, in its own thread."""
-        for name, start_price in self.items:
-            # Don't auction to an empty room: wait for enough bidders first.
-            while not self.stop_event.is_set():
-                with self.lock:
-                    if len(self.clients) >= self.min_clients:
-                        break
-                time.sleep(0.1)
-            if self.stop_event.is_set():
-                return
-
+        """Runs queued items one after another, in its own thread."""
+        announced_done = False
+        while not self.stop_event.is_set():
             with self.lock:
-                self.current = {"item": name, "start_price": start_price,
-                                "high_bid": start_price, "high_bidder": None,
-                                "accepted": 0, "extensions": 0,
-                                "ends_at": time.monotonic() + self.duration}
-                log(f"Auction started: {name} (start {start_price})")
-                self._broadcast_locked({"type": "item_start", "item": name,
-                                        "start_price": start_price, "ends_in": self.duration})
+                bidders = sum(1 for c in self.clients.values() if c.role == "bidder")
+                if self.queue and bidders >= self.min_clients:
+                    # Don't auction to an empty room: items wait in the queue
+                    # until enough bidders are connected.
+                    item = self.queue.popleft()
+                    self.current = {"item": item["name"], "start_price": item["start_price"],
+                                    "seller": item["seller"],
+                                    "high_bid": item["start_price"], "high_bidder": None,
+                                    "accepted": 0, "extensions": 0,
+                                    "ends_at": time.monotonic() + item["duration"]}
+                    log(f"Auction started: {item['name']} (start {item['start_price']})")
+                    self._broadcast_locked({"type": "item_start", "item": item["name"],
+                                            "start_price": item["start_price"],
+                                            "ends_in": item["duration"],
+                                            "seller": item["seller"]})
+                    self._broadcast_locked(self._queue_msg_locked())
+                    announced_done = False
+                else:
+                    item = None
+                    # Queue empty, something was sold, and no auctioneer is around
+                    # to list more: tell everyone the session is over (once).
+                    if (not self.queue and self.results and not announced_done
+                            and not any(c.role == "auctioneer" for c in self.clients.values())):
+                        self._broadcast_locked({"type": "all_done", "results": self.results})
+                        log("All items sold.")
+                        announced_done = True
+            if item is None:
+                time.sleep(0.1)
+                continue
 
             while not self.stop_event.is_set():
                 time.sleep(0.02)  # polling granularity = timer accuracy (~20 ms)
@@ -405,17 +498,14 @@ class AuctionServer:
                         result = {"type": "auction_end", "item": cur["item"],
                                   "winner": cur["high_bidder"],
                                   "amount": cur["high_bid"] if cur["high_bidder"] else None,
-                                  "accepted_bids": cur["accepted"]}
+                                  "accepted_bids": cur["accepted"],
+                                  "seller": cur["seller"]}
                         self.results.append(result)
                         self.current = None
                         log(f"Auction ended: {result}")
                         self._broadcast_locked(result)
                         break
             time.sleep(self.pause)
-
-        with self.lock:
-            self._broadcast_locked({"type": "all_done", "results": self.results})
-        log("All items sold.")
 
 
 def parse_items(text):
