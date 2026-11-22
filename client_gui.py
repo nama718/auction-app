@@ -51,6 +51,7 @@ REJECTIONS = {
     "no_active_auction": "No auction is running right now",
     "invalid_amount": "Enter a whole number above 0",
     "auctioneer_cannot_bid": "Auctioneers cannot bid",
+    "insufficient_funds": "Not enough balance",
 }
 LIST_REJECTIONS = {
     "not_auctioneer": "Only auctioneers can list items",
@@ -60,7 +61,9 @@ LIST_REJECTIONS = {
 
 
 class AuctionApp:
+    """The whole GUI: a connect screen, then the live auction screen (see module docstring)."""
     def __init__(self, root, host="127.0.0.1", port=5000, nick="", role="bidder"):
+        """Build both screens, show the connect screen and start the polling loops."""
         self.root = root
         self.events = queue.Queue()  # reader thread -> Tk main thread
         self.client = None
@@ -77,6 +80,7 @@ class AuctionApp:
 
     # ------------------------------------------------------------- state
     def _reset_state(self):
+        """Forget everything about the previous connection (item, bids, balance, users)."""
         self.nick, self.role = "", "bidder"
         self.item = None             # name of the item on screen (running or just ended)
         self.seller = None
@@ -88,10 +92,12 @@ class AuctionApp:
         self.deadline = None         # time.monotonic() when the item ends
         self.total = 1.0             # length of the item, for the progress bar
         self.min_next = 1
+        self.balance = 0             # play money, as last reported by the server
         self.users = {}              # nick -> role
         self.queue_items = []
 
     def _setup_style(self):
+        """Pick the ttk theme and define the fonts and colours used everywhere."""
         r = self.root
         r.configure(bg=BG)
         base = tkfont.nametofont("TkDefaultFont").actual()["family"]
@@ -125,6 +131,7 @@ class AuctionApp:
 
     # ------------------------------------------------------ connect screen
     def _build_connect(self, host, port, nick, role):
+        """Create the connect screen: server, port, nickname and role."""
         f = self.connect_frame = ttk.Frame(self.root, padding=30)
         box = ttk.Frame(f, style="Card.TFrame", padding=28)
         box.place(relx=0.5, rely=0.45, anchor="center")
@@ -160,6 +167,7 @@ class AuctionApp:
 
     # --------------------------------------------------------- main screen
     def _build_main(self):
+        """Create the auction screen: item card, bid or listing box, queue, people, feed."""
         m = self.main = ttk.Frame(self.root, padding=14)
         m.columnconfigure(0, weight=3)
         m.columnconfigure(1, weight=2)
@@ -170,6 +178,8 @@ class AuctionApp:
         ttk.Button(head, text="Leave", command=self.leave).pack(side="right")
         self.lbl_who = ttk.Label(head, style="Muted.TLabel")
         self.lbl_who.pack(side="right", padx=14)
+        self.lbl_balance = ttk.Label(head, style="Section.TLabel", foreground=ACCENT)
+        self.lbl_balance.pack(side="right", padx=14)
 
         # --- current item card
         card = ttk.Frame(m, style="Card.TFrame", padding=18)
@@ -261,6 +271,7 @@ class AuctionApp:
         self.txt.tag_configure("bold", font=self.f(10, True))
 
     def _listbox(self, parent, row):
+        """Create one small read-only list (used for the queue and the people list)."""
         lb = tk.Listbox(parent, height=4, relief="flat", bg=CARD, fg=INK, font=self.f(10),
                         highlightthickness=0, activestyle="none", selectbackground=CARD,
                         selectforeground=INK)
@@ -269,6 +280,7 @@ class AuctionApp:
 
     # ---------------------------------------------------------- screens
     def show_connect(self):
+        """Switch the window to the connect screen."""
         self.main.pack_forget()
         self.connect_frame.pack(fill="both", expand=True)
         self.root.title("Live Auction: connect")
@@ -277,6 +289,7 @@ class AuctionApp:
         self.entry_nick.focus_set()
 
     def show_main(self):
+        """Switch to the auction screen and show the bid box or the listing form by role."""
         self.connect_frame.pack_forget()
         self.main.pack(fill="both", expand=True)
         self.root.title(f"Live Auction: {self.nick} ({self.role})")
@@ -293,6 +306,7 @@ class AuctionApp:
 
     # --------------------------------------------------------- connecting
     def connect(self):
+        """Validate the form, open the connection and send 'join' (the welcome comes back later)."""
         if self.client is not None:
             return
         host, nick = self.var_host.get().strip(), self.var_nick.get().strip()
@@ -323,11 +337,13 @@ class AuctionApp:
         self.client = client
 
     def leave(self):
+        """Disconnect politely and go back to the connect screen."""
         self._end_connection()
         self.show_connect()
         self.lbl_connect_msg.configure(text="", foreground=BAD)
 
     def _end_connection(self):
+        """Close the socket and reset all state; late events from it are ignored."""
         self.gen += 1  # anything the old connection still delivers is now ignored
         if self.client is not None:
             self.client.close()
@@ -337,26 +353,33 @@ class AuctionApp:
         self._clear_feed()
 
     def shutdown(self):
+        """Window close button: disconnect, then close the window."""
         self._end_connection()
         self.root.destroy()
 
     # ------------------------------------------------------------ actions
     def place_bid(self):
+        """Send the number in the bid box as a bid (after the same checks the server makes)."""
         text = self.var_bid.get().strip()
         if not self.client or not self.active:
             return
         if not text.isdigit() or int(text) <= 0:
             self._hint("Enter a whole number above 0", BAD)
             return
+        if int(text) > self.balance:  # same rule the server applies; saves a round trip
+            self._hint(f"Not enough balance (you have {self.balance})", BAD)
+            return
         self.req_id += 1
         self.client.bid(int(text), self.req_id)
         self._hint("", MUTED)
 
     def bid_minimum(self):
+        """Fill the bid box with the lowest legal bid and send it."""
         self.var_bid.set(str(self.min_next))
         self.place_bid()
 
     def list_item(self):
+        """Auctioneer: validate the form and ask the server to queue the item."""
         name, price, dur = self.var_name.get().strip(), self.var_price.get().strip(), self.var_dur.get().strip()
         if not name or len(name) > MAX_ITEM_NAME:
             return self._list_status(f"Item name must be 1 to {MAX_ITEM_NAME} characters", BAD)
@@ -371,9 +394,11 @@ class AuctionApp:
         self._list_status("Sending...", MUTED)
 
     def _hint(self, text, color):
+        """Show a short message under the bid box."""
         self.lbl_hint.configure(text=text, foreground=color)
 
     def _list_status(self, text, color):
+        """Show a short message under the listing form."""
         self.lbl_list_status.configure(text=text, foreground=color)
 
     # ----------------------------------------------------- message intake
@@ -389,11 +414,13 @@ class AuctionApp:
         self.root.after(40, self._pump)
 
     def handle(self, msg):
+        """Update the state and the screen for ONE server message (runs on the Tk thread)."""
         t = msg.get("type")
         if not self.joined and self.client is not None:
             if t == "welcome":
                 self.joined = True
                 self.role = msg.get("role", self.role)
+                self.balance = msg.get("balance", 0)
                 auct = set(msg.get("auctioneers", []))
                 self.users = {u: ("auctioneer" if u in auct else "bidder") for u in msg["users"]}
                 self.show_main()
@@ -422,6 +449,9 @@ class AuctionApp:
                 self.min_next = max(self.min_next, msg["minimum"])
             why = REJECTIONS.get(msg.get("reason"), msg.get("reason"))
             extra = f" (minimum {msg['minimum']})" if "minimum" in msg else ""
+            if "balance" in msg:  # insufficient_funds: the server tells us the truth
+                self.balance = msg["balance"]
+                extra = f" (you have {msg['balance']})"
             self.log(f"Bid rejected: {why}{extra}", "bad")
             self._hint(f"{why}{extra}", BAD)
         elif t == "new_high_bid":
@@ -433,6 +463,9 @@ class AuctionApp:
             self._hint("", MUTED)
         elif t == "auction_end":
             self._on_end(msg)
+        elif t == "balance":  # private: we just paid for, or were paid for, an item
+            self.balance = msg["balance"]
+            self.log(f"Your balance is now {self.balance}", "muted")
         elif t == "queue":
             self.queue_items = msg["items"]
             self._refresh_queue()
@@ -465,6 +498,7 @@ class AuctionApp:
         self.refresh()
 
     def _connect_failed(self, text):
+        """Join did not work (bad nickname, server closed): stay on the connect screen."""
         self.gen += 1
         if self.client is not None:
             self.client.close()
@@ -473,6 +507,7 @@ class AuctionApp:
         self.btn_connect.state(["!disabled"])
 
     def _on_state(self, msg):
+        """Apply a 'state' reply: the running item, its bids and the time left."""
         if msg.get("item") is None:
             if not self.ended:
                 self.item, self.active, self.deadline = None, False, None
@@ -486,6 +521,7 @@ class AuctionApp:
         self.active, self.ended = True, None
 
     def _on_item_start(self, msg):
+        """A new item has started: reset the card, the bid box and the countdown."""
         self.item, self.seller = msg["item"], msg.get("seller")
         self.start_price = self.high_bid = msg["start_price"]
         self.min_next = msg["start_price"]
@@ -498,6 +534,7 @@ class AuctionApp:
         self.log(f"NEW ITEM: {msg['item']}{by}, starting at {msg['start_price']}", "warn")
 
     def _on_end(self, msg):
+        """The item is over: stop the clock and remember the result for the banner."""
         self.active, self.deadline, self.ended = False, None, msg
         if msg["winner"]:
             tag = "good" if msg["winner"] == self.nick else "warn"
@@ -546,6 +583,10 @@ class AuctionApp:
                     text=f"Highest bidder: {who}" if self.high_bidder else "No bids yet")
                 self.lbl_banner.configure(
                     text="You are the highest bidder" if mine else "", foreground=GOOD)
+        # While you lead, your bid is "held": shown here, charged when the item ends.
+        held = self.high_bid if (self.active and self.high_bidder == self.nick) else 0
+        self.lbl_balance.configure(
+            text=f"Balance: {self.balance}" + (f" ({held} held)" if held else ""))
         bidding = self.active and self.role == "bidder"
         self.btn_bid.state(["!disabled"] if bidding else ["disabled"])
         self.btn_min.state(["!disabled"] if bidding else ["disabled"])
@@ -559,6 +600,7 @@ class AuctionApp:
             self.var_bid.set(str(self.min_next) if self.active else "")
 
     def _tick(self):
+        """Runs every 100 ms: redraw the countdown and progress bar from the local clock."""
         if self.deadline is not None and self.active:
             rem = max(0.0, self.deadline - time.monotonic())
             self.lbl_time.configure(text=f"{rem:4.1f}s" if rem < 10 else f"{int(rem)}s",
@@ -567,6 +609,7 @@ class AuctionApp:
         self.root.after(100, self._tick)
 
     def _refresh_queue(self):
+        """Redraw the 'Up next' list."""
         self.lst_queue.delete(0, "end")
         if not self.queue_items:
             self.lst_queue.insert("end", "(nothing queued)")
@@ -575,6 +618,7 @@ class AuctionApp:
             self.lst_queue.insert("end", f"{i}. {it['item']}  from {it['start_price']}  ({by})")
 
     def _refresh_users(self):
+        """Redraw the 'People online' list, tagging auctioneers and yourself."""
         self.lst_users.delete(0, "end")
         for n in sorted(self.users):
             tags = []
@@ -585,6 +629,7 @@ class AuctionApp:
             self.lst_users.insert("end", n + (f"  ({', '.join(tags)})" if tags else ""))
 
     def log(self, text, tag="info"):
+        """Append one timestamped line to the live feed."""
         self.txt.configure(state="normal")
         self.txt.insert("end", time.strftime("%H:%M:%S  "), "muted")
         self.txt.insert("end", text + "\n", tag)
@@ -592,6 +637,7 @@ class AuctionApp:
         self.txt.see("end")
 
     def _clear_feed(self):
+        """Empty the feed and the side lists (used when leaving)."""
         self.txt.configure(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.configure(state="disabled")
@@ -601,6 +647,7 @@ class AuctionApp:
 
 
 def main():
+    """Parse the command-line options and open the window."""
     ap = argparse.ArgumentParser(description="Auction GUI client")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5000)

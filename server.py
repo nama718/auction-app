@@ -16,6 +16,11 @@ WHY THIS DESIGN
     * Two roles: a BIDDER bids; an AUCTIONEER lists items for sale (and cannot
       bid, so nobody can ever bid on their own item). Listed items join a FIFO
       queue behind the built-in default items.
+    * Play money: every bidder starts with a balance (default 500). A bid above
+      your balance is refused, and the winner is charged when the item ends
+      (the auctioneer who listed it is credited). Because only ONE item runs at
+      a time, the winning bid is effectively "held": your balance cannot change
+      before the item ends, so you can never win something you cannot pay for.
     * ONE global lock around auction state: two clients can bid at the same
       instant; the lock turns "simultaneous" into "one after the other", so
       exactly one of them wins and the order is the same for everybody.
@@ -34,7 +39,8 @@ APPLICATION-LAYER PROTOCOL
         {"type":"leave"}
     Server -> Client
         {"type":"welcome",      "nick":"alice", "role":"bidder", "users":["alice","bob"],
-                                "auctioneers":["carol"]}
+                                "auctioneers":["carol"], "balance":500}
+        {"type":"balance",      "balance":420}     (sent to buyer and seller after a sale)
         {"type":"item_start",   "item":"Watch", "start_price":50, "ends_in":30.0,
                                 "seller":"carol" | null}
         {"type":"item_listed",  "id":1, "item":"Lamp", "position":2}
@@ -43,6 +49,7 @@ APPLICATION-LAYER PROTOCOL
         {"type":"state",        "item":..., "high_bid":..., "high_bidder":..., "ends_in":...}
         {"type":"bid_accepted", "id":7, "amount":120, "seq":3}
         {"type":"bid_rejected", "id":7, "reason":"too_low", "minimum":121}
+                                (or "insufficient_funds" with "balance":50)
         {"type":"new_high_bid", "nick":"bob", "amount":125, "seq":4, "ends_in":12.3,
                                 "client_ts":...}
         {"type":"auction_end",  "item":"Watch", "winner":"bob", "amount":125,
@@ -106,6 +113,7 @@ class ClientConn:
     """
 
     def __init__(self, sock, addr):
+        """Set up the socket, the outgoing queue and the per-connection flags."""
         self.sock = sock
         self.addr = addr
         self.nick = None  # None until the client has sent a valid "join"
@@ -178,7 +186,8 @@ class AuctionServer:
     self.lock (a reentrant lock, so helpers may be called with it held)."""
 
     def __init__(self, host, port, items, duration, pause,
-                 min_increment, min_clients, anti_snipe):
+                 min_increment, min_clients, anti_snipe, start_balance=500):
+        """Store the settings and create empty shared state (clients, queue, accounts)."""
         self.host = host
         self.port = port
         # FIFO queue of items waiting to be auctioned. Default items are put in
@@ -191,6 +200,10 @@ class AuctionServer:
         self.min_increment = min_increment
         self.min_clients = min_clients  # wait for this many bidders before starting an item
         self.anti_snipe = anti_snipe    # seconds; 0 disables
+        self.start_balance = start_balance  # play money each new bidder starts with
+        # nick -> balance. Kept for the whole server run (even after a user
+        # disconnects) so leaving and rejoining cannot reset your money.
+        self.accounts = {}
         self.lock = threading.RLock()
         self.clients = {}               # nick -> ClientConn (only joined clients)
         self.current = None             # dict describing the running auction, or None
@@ -213,6 +226,7 @@ class AuctionServer:
         log(f"Auction server listening on {self.host}:{self.port}")
 
     def stop(self):
+        """Stop the accept loop and the auction timer."""
         self.stop_event.set()
         try:
             self.listener.close()
@@ -220,6 +234,7 @@ class AuctionServer:
             pass
 
     def _accept_loop(self):
+        """Accept new TCP connections; each gets its own reader and writer thread."""
         while not self.stop_event.is_set():
             try:
                 sock, addr = self.listener.accept()
@@ -260,6 +275,7 @@ class AuctionServer:
             self._drop(conn)  # ALWAYS clean up, however the loop ended
 
     def _protocol_error(self, conn, code):
+        """Send an error, then close the connection once the error has been delivered."""
         conn.send({"type": "error", "code": code})
         conn.request_close()
 
@@ -281,6 +297,7 @@ class AuctionServer:
 
     # -------------------------------------------------------- message handling
     def _process(self, conn, line):
+        """Parse one line of JSON and route it by its 'type' field."""
         try:
             msg = json.loads(line)
         except ValueError:  # JSONDecodeError and UnicodeDecodeError both land here
@@ -311,6 +328,7 @@ class AuctionServer:
             conn.send({"type": "error", "code": "unknown_type"})
 
     def _do_join(self, conn, msg):
+        """Handle 'join': validate nickname and role, register the client, open its account."""
         nick = msg.get("nick")
         if not isinstance(nick, str) or not NICK_RE.match(nick):
             conn.send({"type": "error", "code": "invalid_nick"})
@@ -326,8 +344,12 @@ class AuctionServer:
             self.clients[nick] = conn
             conn.nick = nick
             conn.role = role
+            # First visit: bidders get the starting balance, auctioneers start
+            # at 0 and earn money by selling. A returning nick keeps its balance.
+            self.accounts.setdefault(nick, self.start_balance if role == "bidder" else 0)
             log(f"{nick} joined as {role} from {conn.addr[0]}")
             conn.send({"type": "welcome", "nick": nick, "role": role,
+                       "balance": self.accounts[nick],
                        "users": sorted(self.clients),
                        "auctioneers": sorted(n for n, c in self.clients.items()
                                              if c.role == "auctioneer")})
@@ -368,6 +390,7 @@ class AuctionServer:
             self._broadcast_locked(self._queue_msg_locked())
 
     def _do_bid(self, conn, msg):
+        """Handle 'bid': validate the amount, then judge it under the global lock."""
         amount = msg.get("amount")
         bid_id = msg.get("id")  # echoed back so the client can match replies
         # bool is a subclass of int in Python, so exclude it explicitly.
@@ -399,6 +422,14 @@ class AuctionServer:
             if amount < minimum:
                 conn.send({"type": "bid_rejected", "id": bid_id, "reason": "too_low",
                            "minimum": minimum})
+                return
+
+            # Can they pay? Nothing can change this balance before the item ends
+            # (only one item runs at a time), so checking here is enough.
+            balance = self.accounts[conn.nick]
+            if amount > balance:
+                conn.send({"type": "bid_rejected", "id": bid_id, "reason": "insufficient_funds",
+                           "balance": balance})
                 return
 
             cur["high_bid"] = amount
@@ -434,14 +465,17 @@ class AuctionServer:
                 c.send(msg)
 
     def _queue_msg_locked(self):
+        """Build the 'queue' message listing the items waiting to be auctioned."""
         return {"type": "queue",
                 "items": [{"item": i["name"], "start_price": i["start_price"],
                            "seller": i["seller"]} for i in self.queue]}
 
     def _send_queue_locked(self, conn):
+        """Send the current queue to one client."""
         conn.send(self._queue_msg_locked())
 
     def _send_state_locked(self, conn):
+        """Send one client the running item's state, or 'no auction' if idle."""
         cur = self.current
         if cur is None:
             conn.send({"type": "state", "item": None})
@@ -450,6 +484,21 @@ class AuctionServer:
                        "start_price": cur["start_price"],
                        "high_bid": cur["high_bid"], "high_bidder": cur["high_bidder"],
                        "ends_in": round(max(0.0, cur["ends_at"] - time.monotonic()), 2)})
+
+    def _settle_locked(self, winner, seller, amount):
+        """Move the money for a finished sale. Caller must hold self.lock.
+
+        The winner pays even if they disconnected: a bid is a commitment. The
+        seller (None for the built-in "house" items) is paid the same amount.
+        Each side that is still connected is told its new balance privately.
+        """
+        self.accounts[winner] -= amount
+        if seller is not None:
+            self.accounts[seller] += amount
+        for nick in (winner, seller):
+            c = self.clients.get(nick)
+            if c:
+                c.send({"type": "balance", "balance": self.accounts[nick]})
 
     # ------------------------------------------------------------ auction timer
     def _auction_loop(self):
@@ -504,6 +553,8 @@ class AuctionServer:
                         self.current = None
                         log(f"Auction ended: {result}")
                         self._broadcast_locked(result)
+                        if cur["high_bidder"]:
+                            self._settle_locked(cur["high_bidder"], cur["seller"], cur["high_bid"])
                         break
             time.sleep(self.pause)
 
@@ -518,6 +569,7 @@ def parse_items(text):
 
 
 def main():
+    """Parse the command-line options and start the server."""
     ap = argparse.ArgumentParser(description="Online auction server")
     ap.add_argument("--host", default="0.0.0.0", help="interface to listen on")
     ap.add_argument("--port", type=int, default=5000)
@@ -528,12 +580,17 @@ def main():
                     help="wait for this many connected users before each item")
     ap.add_argument("--anti-snipe", type=float, default=3.0,
                     help="extend by this many seconds if a bid lands this close to the end (0=off)")
+    ap.add_argument("--balance", type=int, default=500,
+                    help="play money each bidder starts with (default 500)")
     ap.add_argument("--items", default="Vintage Keyboard:10,Mechanical Watch:50,Signed Textbook:5",
                     help="comma list of name:startingPrice")
     args = ap.parse_args()
+    if args.balance < 0:
+        ap.error("--balance must not be negative")
 
     server = AuctionServer(args.host, args.port, parse_items(args.items), args.duration,
-                           args.pause, args.min_increment, args.min_clients, args.anti_snipe)
+                           args.pause, args.min_increment, args.min_clients, args.anti_snipe,
+                           args.balance)
     server.start()
     try:
         while True:

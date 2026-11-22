@@ -28,6 +28,7 @@ class AuctionClient:
     """Thin wrapper over a TCP socket that speaks newline-delimited JSON."""
 
     def __init__(self, host, port, nick, on_message=None, role="bidder"):
+        """Remember where to connect and who we are; nothing is opened until connect()."""
         self.host, self.port, self.nick, self.role = host, port, nick, role
         self.on_message = on_message or (lambda msg, t: None)
         self.sock = None
@@ -65,6 +66,7 @@ class AuctionClient:
         self.on_message({"type": "_disconnected"}, time.time())
 
     def send(self, msg):
+        """Serialize msg as one line of JSON and send it (safe to call from many threads)."""
         data = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
         with self._send_lock:  # keep each message's bytes contiguous
             self.sock.sendall(data)
@@ -72,6 +74,7 @@ class AuctionClient:
     def bid(self, amount, bid_id=None):
         # client_ts lets the server echo our send time to other clients, which
         # is how the evaluation measures end-to-end broadcast latency.
+        """Place a bid; 'id' lets the caller match the reply, 'client_ts' lets tests time it."""
         self.send({"type": "bid", "amount": amount, "id": bid_id, "client_ts": time.time()})
 
     def list_item(self, name, start_price, duration=None, req_id=None):
@@ -108,8 +111,8 @@ def describe(msg):
     """Turn a server message into one human-readable line for the CLI."""
     t = msg.get("type")
     if t == "welcome":
-        return (f"Connected as {msg['nick']} ({msg.get('role', 'bidder')}). "
-                f"Users online: {', '.join(msg['users'])}")
+        return (f"Connected as {msg['nick']} ({msg.get('role', 'bidder')}), "
+                f"balance {msg.get('balance', 0)}. Users online: {', '.join(msg['users'])}")
     if t == "item_start":
         by = f" (sold by {msg['seller']})" if msg.get("seller") else ""
         return f"NEW ITEM: {msg['item']}{by} - starting at {msg['start_price']} ({msg['ends_in']}s)"
@@ -123,7 +126,11 @@ def describe(msg):
         return f"Your bid of {msg['amount']} is the highest!"
     if t == "bid_rejected":
         extra = f" (minimum {msg['minimum']})" if "minimum" in msg else ""
+        if "balance" in msg:
+            extra = f" (your balance is {msg['balance']})"
         return f"Bid rejected: {msg['reason']}{extra}"
+    if t == "balance":
+        return f"Your balance is now {msg['balance']}."
     if t == "new_high_bid":
         return f"{msg['nick']} bid {msg['amount']} ({msg['ends_in']}s left)"
     if t == "auction_end":
@@ -150,6 +157,7 @@ def describe(msg):
 
 
 def main():
+    """Command-line entry point: connect, then read commands from the keyboard."""
     ap = argparse.ArgumentParser(description="Auction client")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5000)
@@ -160,6 +168,7 @@ def main():
     done = threading.Event()
 
     def show(msg, _t):
+        """Reader-thread callback: print every server message as one readable line."""
         print(describe(msg), flush=True)
         if msg.get("type") == "_disconnected":
             done.set()
