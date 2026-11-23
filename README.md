@@ -18,6 +18,8 @@ A command-line client also exists but is not needed.
 
 ## Where to read the code
 
+Start with the [code walkthrough](code-walkthrough.md) for a complete auction round, including what happens when two bids arrive together.
+
 Follow a bid from the screen to the server and back:
 
 1. [Desktop interface](frontend/gui.py): `AuctionApp.place_bid` captures the displayed item and amount.

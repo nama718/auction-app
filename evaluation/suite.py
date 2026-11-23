@@ -179,6 +179,7 @@ def test_stream_and_contention():
             starts = [p.wait_type("item_start") for p in players]
             gate = threading.Barrier(2)
             def offer(player):
+                """Wait for the other bidder so both compete for the same price."""
                 gate.wait(timeout=2)
                 player.client.bid(25, 1)
             threads = [threading.Thread(target=offer, args=(p,)) for p in players]
