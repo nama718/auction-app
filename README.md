@@ -16,13 +16,16 @@ A command-line client also exists but is not needed.
   Linux installs run `sudo apt install python3-tk` first.
 - If `python` is not recognized, use `py` (Windows) or `python3` (macOS/Linux).
 
-## Files
-| File | Purpose |
-|---|---|
-| `server.py` | The auction server (TCP, newline-delimited JSON) |
-| `client_gui.py` | Tkinter desktop client (bidder view and auctioneer view) |
-| `client.py` | `AuctionClient` class (used by the GUI and the tests) plus an optional command-line client |
-| `eval_tests.py` | Automated functionality, robustness and load tests |
+## Where to read the code
+
+Follow a bid from the screen to the server and back:
+
+1. [Desktop interface](frontend/gui.py): `AuctionApp.place_bid` captures the displayed item and amount.
+2. [TCP client](frontend/client.py): `AuctionClient.bid` sends the request. The reader delivers replies and broadcasts to the interface.
+3. [Auction server](backend/server.py): `AuctionServer._do_bid` validates and records the bid under the auction lock. The module header describes the wire messages.
+4. [Evaluation suite](evaluation/suite.py): start with `test_functionality` for the two-bidder flow, then `load_test` for concurrency and latency measurements.
+
+[Protocol limits](protocol.py) are shared by the GUI and server. The root scripts are the launch commands shown below.
 
 ## Quick start (everything on one computer)
 
@@ -141,7 +144,7 @@ Type a whole number to bid, `status` to see the current item, `quit` to leave.
 ## Protocol summary
 One JSON object per line, ending in `\n` (TCP is a byte stream, so the newline
 marks message boundaries). Full message list and the reasoning behind the design
-are documented in the header comment of `server.py`.
+are documented in the header comment of `backend/server.py`.
 
 Each active state and item start includes an integer auction_id. Bids must echo the ID of the displayed item; older clients must be updated. Results are announced when the queue drains, even with an auctioneer connected. Nicknames identify play-money balances on a trusted demo network; they do not authenticate returning users.
 
