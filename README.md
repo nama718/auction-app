@@ -26,30 +26,30 @@ A command-line client also exists but is not needed.
 
 ## Quick start (everything on one computer)
 
-Open a separate terminal window for each step. Replace the path with wherever
-you put the project folder.
+Open a separate terminal window for each step. Replace `path\to\auction-app` with
+the folder where you unzipped the project (e.g. `cd C:\Users\you\Downloads\auction-app`).
 
 **1. Server**
 ```
-cd C:\Users\amanb\downloads\auction-app
+cd path\to\auction-app
 python server.py --port 5000 --duration 30
 ```
 
 **2. Bidder window (alice)**
 ```
-cd C:\Users\amanb\downloads\auction-app
+cd path\to\auction-app
 python client_gui.py --nick alice
 ```
 
 **3. Bidder window (bob)**
 ```
-cd C:\Users\amanb\downloads\auction-app
+cd path\to\auction-app
 python client_gui.py --nick bob
 ```
 
 **4. Auctioneer window (carol)**
 ```
-cd C:\Users\amanb\downloads\auction-app
+cd path\to\auction-app
 python client_gui.py --nick carol --role auctioneer
 ```
 
@@ -135,7 +135,7 @@ back and forth, close one bidder window abruptly and watch the others keep going
 
 ## Run the evaluation
 ```
-cd C:\Users\amanb\downloads\auction-app
+cd path\to\auction-app
 python eval_tests.py          # full run, about 60 seconds
 python eval_tests.py --quick  # smaller load test
 ```
