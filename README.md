@@ -16,13 +16,16 @@ A command-line client also exists but is not needed.
   Linux installs run `sudo apt install python3-tk` first.
 - If `python` is not recognized, use `py` (Windows) or `python3` (macOS/Linux).
 
-## Files
-| File | Purpose |
-|---|---|
-| `server.py` | The auction server (TCP, newline-delimited JSON) |
-| `client_gui.py` | Tkinter desktop client (bidder view and auctioneer view) |
-| `client.py` | `AuctionClient` class (used by the GUI and the tests) plus an optional command-line client |
-| `eval_tests.py` | Automated functionality, robustness and load tests |
+## Where to read the code
+
+Follow a bid from the screen to the server and back:
+
+1. [Desktop interface](frontend/gui.py): `AuctionApp.place_bid` captures the displayed item and amount.
+2. [TCP client](frontend/client.py): `AuctionClient.bid` sends the request. The reader delivers replies and broadcasts to the interface.
+3. [Auction server](backend/server.py): `AuctionServer._do_bid` validates and records the bid under the auction lock. The module header describes the wire messages.
+4. [Evaluation suite](evaluation/suite.py): start with `test_functionality` for the two-bidder flow, then `load_test` for concurrency and latency measurements.
+
+[Protocol limits](protocol.py) are shared by the GUI and server. The root scripts are the launch commands shown below.
 
 ## Quick start (everything on one computer)
 
@@ -84,18 +87,7 @@ machines only need the server's address and port.
    ```
    (or type the IP into the "Server" box on the connect screen).
 
-**Different networks (over the internet)**
-Pick one of these, because home and school routers block incoming connections
-by default:
-- *Easiest: a virtual private network such as Tailscale or ZeroTier.* Install
-  it on every computer, then use the server's Tailscale/ZeroTier IP exactly as
-  in the LAN steps above. No router changes needed.
-- *Port forwarding:* on the server's router, forward TCP port 5000 to the
-  server computer's local IP, then clients connect to the router's public IP
-  (search "what is my IP"). This does not work behind campus Wi-Fi or
-  carrier-grade NAT.
-- *TCP tunnel* (for example `ngrok tcp 5000`): use the host and port it prints
-  as the Server and Port in the GUI.
+**Different networks:** Use a private team VPN and connect to the server's VPN address. This classroom application uses plaintext TCP and nickname-based accounts. Keep it on a trusted network. For a single-computer demo, pass `--host 127.0.0.1` to the server.
 
 **If a client cannot connect**: check that the server is running, the IP and
 port are right, both machines are on the same network (or the VPN is up), and
@@ -140,7 +132,7 @@ python eval_tests.py          # full run, about 60 seconds
 python eval_tests.py --quick  # smaller load test
 ```
 It starts its own server on a free port (no need to start yours), prints PASS/FAIL for each check, and saves the
-load-test numbers to `results.json`. Expected: `67 passed, 0 failed`.
+load-test numbers to `results.json`. The full run includes 10, 25 and 50 local bidders. RTT measures bid-to-reply time on loopback; broadcast timing measures arrival at the client callback, before GUI rendering.
 
 ## Optional: command-line client
 ```
@@ -152,7 +144,9 @@ Type a whole number to bid, `status` to see the current item, `quit` to leave.
 ## Protocol summary
 One JSON object per line, ending in `\n` (TCP is a byte stream, so the newline
 marks message boundaries). Full message list and the reasoning behind the design
-are documented in the header comment of `server.py`.
+are documented in the header comment of `backend/server.py`.
+
+Each active state and item start includes an integer auction_id. Bids must echo the ID of the displayed item; older clients must be updated. Results are announced when the queue drains, even with an auctioneer connected. Nicknames identify play-money balances on a trusted demo network; they do not authenticate returning users.
 
 Client to server: `join` (with `role`), `bid`, `list_item` (auctioneers only),
 `status`, `leave`.

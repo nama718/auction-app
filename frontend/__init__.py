@@ -1,0 +1,1 @@
+"""Bidder and auctioneer clients."""
