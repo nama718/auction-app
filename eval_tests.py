@@ -215,6 +215,28 @@ def test_robustness():
             p.client.close()
 
 
+def test_keepalive():
+    """Dead-connection detection: the server enables TCP keepalive on its sockets.
+
+    We cannot unplug a cable in a test, so we check the part we control: that the
+    option is switched on, with the short timers, on a real connected socket."""
+    import server  # the same helper the server applies to every accepted client
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    cli = socket.create_connection(listener.getsockname())
+    srv_side, _ = listener.accept()
+    server.enable_keepalive(srv_side, idle=20, interval=5, probes=2)
+    ok = srv_side.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) != 0
+    if hasattr(socket, "TCP_KEEPIDLE"):  # Linux exposes the timers, so verify them too
+        ok = ok and (srv_side.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 20
+                     and srv_side.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) == 5
+                     and srv_side.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == 2)
+    check("server turns on TCP keepalive (with short timers) to detect dead clients", ok)
+    for sk in (cli, srv_side, listener):
+        sk.close()
+
+
 # ---------------------------------------------------------------- 3. AUCTIONEER
 def test_auctioneer():
     """Group 3: listing items, the queue, and the auctioneer rules."""
@@ -460,6 +482,7 @@ def main():
 
     test_functionality()
     test_robustness()
+    test_keepalive()
     test_auctioneer()
     test_balances()
     sizes = [(10, 5)] if args.quick else [(10, 8), (25, 8), (50, 8)]

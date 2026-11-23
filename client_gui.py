@@ -68,6 +68,7 @@ class AuctionApp:
         self.events = queue.Queue()  # reader thread -> Tk main thread
         self.client = None
         self.joined = False
+        self.results_win = None      # the "Final results" window, once all items are sold
         self.gen = 0                 # bumped on every connect/leave; stale events are dropped
         self.req_id = 0
         self._reset_state()
@@ -345,6 +346,9 @@ class AuctionApp:
     def _end_connection(self):
         """Close the socket and reset all state; late events from it are ignored."""
         self.gen += 1  # anything the old connection still delivers is now ignored
+        if self.results_win is not None:
+            self.results_win.destroy()
+            self.results_win = None
         if self.client is not None:
             self.client.close()
             self.client = None
@@ -488,6 +492,7 @@ class AuctionApp:
             self.log(f"{msg['nick']} left", "muted")
         elif t == "all_done":
             self.log("All items sold. Thanks for playing!", "warn")
+            self._show_results(msg.get("results", []))
         elif t == "error":
             self.log(f"Error: {msg.get('code')}", "bad")
         elif t == "_disconnected":
@@ -635,6 +640,41 @@ class AuctionApp:
         self.txt.insert("end", text + "\n", tag)
         self.txt.configure(state="disabled")
         self.txt.see("end")
+
+    def _show_results(self, results):
+        """Pop up a table of every item, its seller, winner and price, plus your own totals."""
+        if self.results_win is not None:
+            self.results_win.destroy()
+        win = self.results_win = tk.Toplevel(self.root)
+        win.title("Final results")
+        win.configure(bg=BG)
+        win.geometry("640x420")
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Final results", style="Title.TLabel").pack(anchor="w")
+
+        cols = ("item", "seller", "winner", "price")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
+        for col, text, width in (("item", "Item", 220), ("seller", "Sold by", 110),
+                                 ("winner", "Winner", 110), ("price", "Price", 80)):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="e" if col == "price" else "w")
+        for r in results:
+            tree.insert("", "end", values=(
+                r["item"], r.get("seller") or "the house",
+                r["winner"] or "no bids", r["amount"] if r["winner"] else "-"))
+        tree.pack(fill="both", expand=True, pady=10)
+
+        mine = [r for r in results if r["winner"] == self.nick]
+        sold = [r for r in results if r.get("seller") == self.nick and r["winner"]]
+        if self.role == "bidder":
+            summary = (f"You won {len(mine)} item(s) and spent {sum(r['amount'] for r in mine)}. "
+                       f"Final balance: {self.balance}.")
+        else:
+            summary = (f"You sold {len(sold)} item(s) for {sum(r['amount'] for r in sold)} in total. "
+                       f"Final balance: {self.balance}.")
+        ttk.Label(frame, text=summary, style="Section.TLabel").pack(anchor="w")
+        ttk.Button(frame, text="Close", command=win.destroy).pack(anchor="e", pady=(10, 0))
 
     def _clear_feed(self):
         """Empty the feed and the side lists (used when leaving)."""

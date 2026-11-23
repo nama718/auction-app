@@ -96,6 +96,35 @@ MAX_ITEM_NAME = 40
 MIN_DURATION, MAX_DURATION = 5, 300
 
 
+# TCP keepalive: if a client's laptop loses Wi-Fi or is unplugged, no FIN or RST
+# ever arrives, so the server would keep that user "online" for hours. With
+# keepalive the OS probes an idle connection and reports it dead when the
+# probes go unanswered, which makes our reader thread fail and clean up.
+KEEPALIVE_IDLE = 30      # seconds of silence before the first probe
+KEEPALIVE_INTERVAL = 10  # seconds between probes
+KEEPALIVE_PROBES = 3     # unanswered probes before the connection is declared dead
+
+
+def enable_keepalive(sock, idle=KEEPALIVE_IDLE, interval=KEEPALIVE_INTERVAL,
+                     probes=KEEPALIVE_PROBES):
+    """Turn on TCP keepalive. The timer options differ per OS, so each is optional."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):      # Windows: one ioctl sets the timers
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
+            return
+        if hasattr(socket, "TCP_KEEPIDLE"):            # Linux
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle)
+        elif hasattr(socket, "TCP_KEEPALIVE"):         # macOS names the idle timer differently
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, idle)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, probes)
+    except OSError:
+        pass  # keepalive is a safety net, never a reason to refuse a client
+
+
 def log(text):
     """Timestamped, flushed print so logs appear immediately when piped."""
     print(time.strftime("%H:%M:%S"), text, flush=True)
@@ -243,6 +272,7 @@ class AuctionServer:
             # Disable Nagle's algorithm: it delays small packets to batch
             # them, which would add latency to every tiny bid message.
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            enable_keepalive(sock)  # notice clients that vanish without saying goodbye
             conn = ClientConn(sock, addr)
             threading.Thread(target=conn.writer_loop, daemon=True).start()
             threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()

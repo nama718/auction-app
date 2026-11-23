@@ -71,7 +71,13 @@ above your balance is refused. When an item ends, the winner is charged and the
 auctioneer who listed it is paid (built-in items are sold by "the house"). A
 winner who disconnects is still charged, and balances are kept for the whole
 server run, so leaving and rejoining does not reset your money. Auctioneers
-start at 0 and earn by selling. The GUI shows your balance in the header.
+start at 0 and earn by selling. The GUI shows your balance in the header, and when every item is sold it opens
+a "Final results" window listing each item, its seller, winner and price, plus
+your own totals.
+
+Dead connections: the server turns on TCP keepalive for every client, so a user
+whose laptop loses Wi-Fi (no goodbye is ever sent) is detected and removed after
+about a minute instead of staying "online" forever.
 
 Rules: a bid must beat the current high bid by at least the minimum increment
 (default 1), you cannot outbid yourself, and a bid placed in the last 3 seconds
@@ -86,7 +92,7 @@ python eval_tests.py          # full run, about 60 seconds
 python eval_tests.py --quick  # smaller load test
 ```
 It starts its own server on a free port, prints PASS/FAIL for each check, and
-saves the load-test numbers to `results.json`. Expected: `66 passed, 0 failed`.
+saves the load-test numbers to `results.json`. Expected: `67 passed, 0 failed`.
 
 ## Protocol summary
 One JSON object per line, ending in `\n` (TCP is a byte stream, so the newline
