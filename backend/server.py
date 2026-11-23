@@ -46,8 +46,8 @@ APPLICATION-LAYER PROTOCOL
         {"type":"item_listed",  "id":1, "item":"Lamp", "position":2}
         {"type":"list_rejected","id":1, "reason":"not_auctioneer" | "invalid_item" | ...}
         {"type":"queue",        "items":[{"item":"Lamp","start_price":20,"seller":"carol"}]}
-        {"type":"state",        "item":..., "high_bid":..., "high_bidder":..., "ends_in":...}
-        {"type":"bid_accepted", "id":7, "amount":120, "seq":3}
+        {"type":"state",        "auction_id":1, "seq":3, "item":..., "high_bid":..., "high_bidder":..., "ends_in":...}
+        {"type":"bid_accepted", "auction_id":1, "ends_in":12.3, "id":7, "amount":120, "seq":3}
         {"type":"bid_rejected", "id":7, "reason":"too_low", "minimum":121}
                                 (or "insufficient_funds" with "balance":50)
         {"type":"new_high_bid", "nick":"bob", "amount":125, "seq":4, "ends_in":12.3,
@@ -65,6 +65,7 @@ USAGE
 import argparse
 import collections
 import json
+import math
 import queue
 from protocol import MAX_DURATION, MAX_ITEM_NAME, MIN_DURATION, NICK_RE
 import socket
@@ -473,13 +474,15 @@ class AuctionServer:
                 cur["extensions"] += 1
                 remaining = cur["ends_at"] - now
 
-            conn.send({"type": "bid_accepted", "id": bid_id, "amount": amount,
-                       "seq": cur["accepted"]})
+            # Build the shared facts once while holding the lock. The bidder and
+            # observers then see the same price, sequence and extended clock.
+            update = {"auction_id": cur["auction_id"], "amount": amount,
+                      "seq": cur["accepted"], "ends_in": round(remaining, 2)}
+            conn.send({"type": "bid_accepted", "id": bid_id, **update})
             # client_ts is copied through unchanged so receivers on the same
             # machine can measure end-to-end broadcast latency (used by tests).
             self._broadcast_locked({"type": "new_high_bid", "item": cur["item"],
-                                    "nick": conn.nick, "amount": amount,
-                                    "seq": cur["accepted"], "ends_in": round(remaining, 2),
+                                    "nick": conn.nick, **update,
                                     "client_ts": msg.get("client_ts")}, exclude=conn)
         # ------------------------------------------------------------------
 
@@ -511,7 +514,7 @@ class AuctionServer:
         if cur is None:
             conn.send({"type": "state", "item": None})
         else:
-            conn.send({"type": "state", "auction_id": cur["auction_id"], "min_increment": self.min_increment, "item": cur["item"], "seller": cur["seller"],
+            conn.send({"type": "state", "seq": cur["accepted"], "auction_id": cur["auction_id"], "min_increment": self.min_increment, "item": cur["item"], "seller": cur["seller"],
                        "start_price": cur["start_price"],
                        "high_bid": cur["high_bid"], "high_bidder": cur["high_bidder"],
                        "ends_in": round(max(0.0, cur["ends_at"] - time.monotonic()), 2)})
@@ -594,7 +597,10 @@ def parse_items(text):
     items = []
     for part in text.split(","):
         name, price = part.rsplit(":", 1)
-        items.append((name.strip(), int(price)))
+        name, price = name.strip(), int(price)
+        if not 1 <= len(name) <= MAX_ITEM_NAME or not 1 <= price <= 10**9:
+            raise ValueError("each item needs a name and a price from 1 to 1000000000")
+        items.append((name, price))
     return items
 
 
@@ -615,10 +621,23 @@ def main():
     ap.add_argument("--items", default="Vintage Keyboard:10,Mechanical Watch:50,Signed Textbook:5",
                     help="comma list of name:startingPrice")
     args = ap.parse_args()
+    # Reject settings that would leave a round stuck or break the timer thread.
+    for option in ("duration", "pause", "anti_snipe"):
+        value = getattr(args, option)
+        if not math.isfinite(value) or value < 0 or (option == "duration" and value == 0):
+            ap.error(f"invalid time for --{option.replace('_', '-')}")
+    if args.min_increment < 1 or args.min_clients < 1:
+        ap.error("--min-increment and --min-clients must be positive")
+    if not 0 <= args.port <= 65535:
+        ap.error("--port must be between 0 and 65535")
+    try:
+        items = parse_items(args.items)
+    except ValueError as exc:
+        ap.error(f"invalid --items: {exc}")
     if args.balance < 0:
         ap.error("--balance must not be negative")
 
-    server = AuctionServer(args.host, args.port, parse_items(args.items), args.duration,
+    server = AuctionServer(args.host, args.port, items, args.duration,
                            args.pause, args.min_increment, args.min_clients, args.anti_snipe,
                            args.balance)
     server.start()

@@ -134,6 +134,24 @@ python eval_tests.py --quick  # smaller load test
 It starts its own server on a free port (no need to start yours), prints PASS/FAIL for each check, and saves the
 load-test numbers to `results.json`. The full run includes 10, 25 and 50 local bidders. RTT measures bid-to-reply time on loopback; broadcast timing measures arrival at the client callback, before GUI rendering.
 
+## What the network tests establish
+
+A bid carries the auction ID the bidder saw. The server checks that ID, the price, the balance and its own monotonic deadline under one lock. Lock acquisition determines the winner of an equal-price race. Client timestamps are for measurements only. Each accepted bid increments the auction's sequence number once. The bidder's reply and the observers' updates carry the same sequence and remaining time, so the bidder can update its clock without requesting another snapshot.
+
+The evaluation sends a join across two writes and a status command in the same write as the end of the join. TCP carries bytes and can choose different packet boundaries. The test checks that the server decodes both complete messages in order. A separate two-bidder race checks that only one equal-price offer wins, both screens' underlying messages agree on the extended deadline, and a late joiner gets the current price and sequence in its first snapshot.
+
+### Local evaluation on Windows, November 23, 2026
+
+The full suite passed 75 checks. Each load round ran for eight seconds using clients and a separate server process on one computer. RTT runs from the client sending its bid to receiving the server's decision. A rejection is a processed decision and counts toward throughput.
+
+| Concurrent bidders | Replies measured | Accepted | Rejected | Median RTT | 95th percentile RTT |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 714 | 669 | 45 | 0.94 ms | 1.86 ms |
+| 25 | 1839 | 1512 | 327 | 1.19 ms | 3.12 ms |
+| 50 | 3592 | 2632 | 960 | 1.11 ms | 2.78 ms |
+
+These measurements cover loopback communication. A two-laptop rehearsal should record the network used, confirm both screens agree on the final winner and price, and measure client-side round-trip time if comparing LAN performance. One-way timing across separate machines needs synchronized clocks.
+
 ## Optional: command-line client
 ```
 python client.py --host 127.0.0.1 --port 5000 --nick alice

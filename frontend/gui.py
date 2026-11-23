@@ -445,7 +445,8 @@ class AuctionApp:
             self.min_next = msg["amount"] + self.min_increment
             self.log(f"Your bid of {msg['amount']} is the highest!", "good")
             self._hint("You are the highest bidder", GOOD)
-            self.client.send({"type": "status"})  # resync the clock (anti-snipe may extend it)
+            self.deadline = time.monotonic() + msg["ends_in"]
+            self.total = max(self.total, msg["ends_in"])
         elif t == "bid_rejected":
             if "minimum" in msg:
                 self.min_next = max(self.min_next, msg["minimum"])
