@@ -110,11 +110,11 @@ def enable_keepalive(sock, idle=KEEPALIVE_IDLE, interval=KEEPALIVE_INTERVAL,
     """Turn on TCP keepalive. The timer options differ per OS, so each is optional."""
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        if hasattr(socket, "SIO_KEEPALIVE_VALS"):      # Windows: one ioctl sets the timers
+        if hasattr(socket, "TCP_KEEPIDLE"):            # Linux, and Windows on Python 3.12+
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle)
+        elif hasattr(socket, "SIO_KEEPALIVE_VALS"):    # older Windows Python: ioctl fallback
             sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
             return
-        if hasattr(socket, "TCP_KEEPIDLE"):            # Linux
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle)
         elif hasattr(socket, "TCP_KEEPALIVE"):         # macOS names the idle timer differently
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, idle)
         if hasattr(socket, "TCP_KEEPINTVL"):
