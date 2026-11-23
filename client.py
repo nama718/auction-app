@@ -32,6 +32,7 @@ class AuctionClient:
         self.host, self.port, self.nick, self.role = host, port, nick, role
         self.on_message = on_message or (lambda msg, t: None)
         self.sock = None
+        self.auction_id = None
         self._send_lock = threading.Lock()  # bots may send from several threads
 
     def connect(self):
@@ -59,6 +60,10 @@ class AuctionClient:
                             msg = json.loads(line)
                         except ValueError:
                             continue  # ignore garbage rather than crash
+                        if not isinstance(msg, dict):
+                            continue
+                        if msg.get("type") in ("item_start", "state"):
+                            self.auction_id = msg.get("auction_id")
                         self.on_message(msg, time.time())
         except OSError:
             pass
@@ -71,11 +76,12 @@ class AuctionClient:
         with self._send_lock:  # keep each message's bytes contiguous
             self.sock.sendall(data)
 
-    def bid(self, amount, bid_id=None):
+    def bid(self, amount, bid_id=None, *, auction_id=None):
         # client_ts lets the server echo our send time to other clients, which
         # is how the evaluation measures end-to-end broadcast latency.
         """Place a bid; 'id' lets the caller match the reply, 'client_ts' lets tests time it."""
-        self.send({"type": "bid", "amount": amount, "id": bid_id, "client_ts": time.time()})
+        self.send({"type": "bid", "auction_id": self.auction_id if auction_id is None else auction_id,
+                   "amount": amount, "id": bid_id, "client_ts": time.time()})
 
     def list_item(self, name, start_price, duration=None, req_id=None):
         """Auctioneers only: put an item in the queue. duration=None uses the

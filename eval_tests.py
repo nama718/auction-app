@@ -281,7 +281,10 @@ def test_auctioneer():
         rej = carol.wait_type("bid_rejected", id=3)
         check("an auctioneer cannot bid", rej is not None and rej["reason"] == "auctioneer_cannot_bid")
 
+        old_id = st["auction_id"]
         st = alice.wait_type("item_start", item="Antique Lamp", timeout=8)
+        alice.client.bid(99, 90, auction_id=old_id)
+        check("previous item bid rejected", alice.wait_type("bid_rejected", id=90, reason="stale_auction") is not None)
         check("listed item starts next with its seller, price and own duration",
               st is not None and st["seller"] == "carol" and st["start_price"] == 20 and st["ends_in"] == 5)
         alice.client.bid(20, 4)
@@ -352,6 +355,7 @@ def test_balances():
         check("the auctioneer is paid, even though the winner disconnected", paid is not None)
         alice2 = Probe(s.port, "alice")
         w = alice2.wait_type("welcome")
+        check("results arrive with seller still connected", carol.wait_type("all_done") is not None)
         check("balance survives disconnect and rejoin (cannot reset by reconnecting)",
               w is not None and w["balance"] == 0)
         check("server still alive", s.alive())

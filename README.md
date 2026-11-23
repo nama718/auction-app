@@ -84,18 +84,7 @@ machines only need the server's address and port.
    ```
    (or type the IP into the "Server" box on the connect screen).
 
-**Different networks (over the internet)**
-Pick one of these, because home and school routers block incoming connections
-by default:
-- *Easiest: a virtual private network such as Tailscale or ZeroTier.* Install
-  it on every computer, then use the server's Tailscale/ZeroTier IP exactly as
-  in the LAN steps above. No router changes needed.
-- *Port forwarding:* on the server's router, forward TCP port 5000 to the
-  server computer's local IP, then clients connect to the router's public IP
-  (search "what is my IP"). This does not work behind campus Wi-Fi or
-  carrier-grade NAT.
-- *TCP tunnel* (for example `ngrok tcp 5000`): use the host and port it prints
-  as the Server and Port in the GUI.
+**Different networks:** Use a private team VPN and connect to the server's VPN address. This classroom application uses plaintext TCP and nickname-based accounts. Keep it on a trusted network. For a single-computer demo, pass `--host 127.0.0.1` to the server.
 
 **If a client cannot connect**: check that the server is running, the IP and
 port are right, both machines are on the same network (or the VPN is up), and
@@ -140,7 +129,7 @@ python eval_tests.py          # full run, about 60 seconds
 python eval_tests.py --quick  # smaller load test
 ```
 It starts its own server on a free port (no need to start yours), prints PASS/FAIL for each check, and saves the
-load-test numbers to `results.json`. Expected: `67 passed, 0 failed`.
+load-test numbers to `results.json`. The full run includes 10, 25 and 50 local bidders. RTT measures bid-to-reply time on loopback; broadcast timing measures arrival at the client callback, before GUI rendering.
 
 ## Optional: command-line client
 ```
@@ -153,6 +142,8 @@ Type a whole number to bid, `status` to see the current item, `quit` to leave.
 One JSON object per line, ending in `\n` (TCP is a byte stream, so the newline
 marks message boundaries). Full message list and the reasoning behind the design
 are documented in the header comment of `server.py`.
+
+Each active state and item start includes an integer auction_id. Bids must echo the ID of the displayed item; older clients must be updated. Results are announced when the queue drains, even with an auctioneer connected. Nicknames identify play-money balances on a trusted demo network; they do not authenticate returning users.
 
 Client to server: `join` (with `role`), `bid`, `list_item` (auctioneers only),
 `status`, `leave`.

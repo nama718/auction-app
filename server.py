@@ -34,7 +34,7 @@ APPLICATION-LAYER PROTOCOL
     Client -> Server
         {"type":"join",   "nick":"alice", "role":"bidder" | "auctioneer"}
         {"type":"list_item", "name":"Lamp", "start_price":20, "duration":30, "id":1}
-        {"type":"bid",    "amount":120, "id":7, "client_ts":1712345678.1}
+        {"type":"bid",    "auction_id":1, "amount":120, "id":7, "client_ts":1712345678.1}
         {"type":"status"}
         {"type":"leave"}
     Server -> Client
@@ -330,7 +330,7 @@ class AuctionServer:
         """Parse one line of JSON and route it by its 'type' field."""
         try:
             msg = json.loads(line)
-        except ValueError:  # JSONDecodeError and UnicodeDecodeError both land here
+        except (ValueError, RecursionError):
             conn.send({"type": "error", "code": "bad_json"})
             return
         if not isinstance(msg, dict) or not isinstance(msg.get("type"), str):
@@ -360,7 +360,7 @@ class AuctionServer:
     def _do_join(self, conn, msg):
         """Handle 'join': validate nickname and role, register the client, open its account."""
         nick = msg.get("nick")
-        if not isinstance(nick, str) or not NICK_RE.match(nick):
+        if not isinstance(nick, str) or not NICK_RE.fullmatch(nick):
             conn.send({"type": "error", "code": "invalid_nick"})
             return
         role = msg.get("role", "bidder")  # old clients send no role: bidder
@@ -444,6 +444,12 @@ class AuctionServer:
             if cur is None or now >= cur["ends_at"]:
                 conn.send({"type": "bid_rejected", "id": bid_id, "reason": "no_active_auction"})
                 return
+            if type(msg.get("auction_id")) is not int or msg["auction_id"] != cur["auction_id"]:
+                conn.send({"type": "bid_rejected", "id": bid_id, "reason": "stale_auction"})
+                return
+            if cur["seller"] == conn.nick:
+                conn.send({"type": "bid_rejected", "id": bid_id, "reason": "own_item"})
+                return
             if cur["high_bidder"] == conn.nick:
                 conn.send({"type": "bid_rejected", "id": bid_id, "reason": "already_highest",
                            "minimum": cur["high_bid"] + self.min_increment})
@@ -510,7 +516,7 @@ class AuctionServer:
         if cur is None:
             conn.send({"type": "state", "item": None})
         else:
-            conn.send({"type": "state", "item": cur["item"], "seller": cur["seller"],
+            conn.send({"type": "state", "auction_id": cur["auction_id"], "min_increment": self.min_increment, "item": cur["item"], "seller": cur["seller"],
                        "start_price": cur["start_price"],
                        "high_bid": cur["high_bid"], "high_bidder": cur["high_bidder"],
                        "ends_in": round(max(0.0, cur["ends_at"] - time.monotonic()), 2)})
@@ -541,13 +547,14 @@ class AuctionServer:
                     # Don't auction to an empty room: items wait in the queue
                     # until enough bidders are connected.
                     item = self.queue.popleft()
-                    self.current = {"item": item["name"], "start_price": item["start_price"],
+                    auction_id = len(self.results) + 1
+                    self.current = {"auction_id": auction_id, "item": item["name"], "start_price": item["start_price"],
                                     "seller": item["seller"],
                                     "high_bid": item["start_price"], "high_bidder": None,
                                     "accepted": 0, "extensions": 0,
                                     "ends_at": time.monotonic() + item["duration"]}
                     log(f"Auction started: {item['name']} (start {item['start_price']})")
-                    self._broadcast_locked({"type": "item_start", "item": item["name"],
+                    self._broadcast_locked({"type": "item_start", "auction_id": auction_id, "min_increment": self.min_increment, "item": item["name"],
                                             "start_price": item["start_price"],
                                             "ends_in": item["duration"],
                                             "seller": item["seller"]})
@@ -555,10 +562,8 @@ class AuctionServer:
                     announced_done = False
                 else:
                     item = None
-                    # Queue empty, something was sold, and no auctioneer is around
-                    # to list more: tell everyone the session is over (once).
-                    if (not self.queue and self.results and not announced_done
-                            and not any(c.role == "auctioneer" for c in self.clients.values())):
+                    # Queue empty and the last auction finished: publish results once.
+                    if not self.queue and self.results and not announced_done:
                         self._broadcast_locked({"type": "all_done", "results": self.results})
                         log("All items sold.")
                         announced_done = True

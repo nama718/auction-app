@@ -92,6 +92,8 @@ class AuctionApp:
         self.ended = None            # the auction_end message, once the item is over
         self.deadline = None         # time.monotonic() when the item ends
         self.total = 1.0             # length of the item, for the progress bar
+        self.auction_id = None
+        self.min_increment = 1
         self.min_next = 1
         self.balance = 0             # play money, as last reported by the server
         self.users = {}              # nick -> role
@@ -374,7 +376,7 @@ class AuctionApp:
             self._hint(f"Not enough balance (you have {self.balance})", BAD)
             return
         self.req_id += 1
-        self.client.bid(int(text), self.req_id)
+        self.client.bid(int(text), self.req_id, auction_id=self.auction_id)
         self._hint("", MUTED)
 
     def bid_minimum(self):
@@ -444,7 +446,7 @@ class AuctionApp:
             self._on_item_start(msg)
         elif t == "bid_accepted":
             self.high_bid, self.high_bidder = msg["amount"], self.nick
-            self.min_next = msg["amount"] + 1
+            self.min_next = msg["amount"] + self.min_increment
             self.log(f"Your bid of {msg['amount']} is the highest!", "good")
             self._hint("You are the highest bidder", GOOD)
             self.client.send({"type": "status"})  # resync the clock (anti-snipe may extend it)
@@ -460,7 +462,7 @@ class AuctionApp:
             self._hint(f"{why}{extra}", BAD)
         elif t == "new_high_bid":
             self.high_bid, self.high_bidder = msg["amount"], msg["nick"]
-            self.min_next = msg["amount"] + 1
+            self.min_next = msg["amount"] + self.min_increment
             self.deadline = time.monotonic() + msg["ends_in"]
             self.total = max(self.total, msg["ends_in"])
             self.log(f"{msg['nick']} bid {msg['amount']}", "bold")
@@ -517,16 +519,20 @@ class AuctionApp:
             if not self.ended:
                 self.item, self.active, self.deadline = None, False, None
             return
+        self.auction_id = msg["auction_id"]
+        self.min_increment = msg["min_increment"]
         self.item, self.seller = msg["item"], msg.get("seller")
         self.start_price, self.high_bid = msg["start_price"], msg["high_bid"]
         self.high_bidder = msg["high_bidder"]
-        self.min_next = self.high_bid + 1 if self.high_bidder else self.start_price
+        self.min_next = self.high_bid + self.min_increment if self.high_bidder else self.start_price
         self.deadline = time.monotonic() + msg["ends_in"]
         self.total = max(self.total if self.active else 0, msg["ends_in"], 1)
         self.active, self.ended = True, None
 
     def _on_item_start(self, msg):
         """A new item has started: reset the card, the bid box and the countdown."""
+        self.auction_id = msg["auction_id"]
+        self.min_increment = msg["min_increment"]
         self.item, self.seller = msg["item"], msg.get("seller")
         self.start_price = self.high_bid = msg["start_price"]
         self.min_next = msg["start_price"]
