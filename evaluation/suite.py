@@ -159,6 +159,56 @@ def test_functionality():
 
 
 # ---------------------------------------------------------------- 2. ROBUSTNESS
+def test_stream_and_contention():
+    """Exercise the wire directly, then race two real clients on one price."""
+    with ServerProc("Headphones:20", duration=3, min_clients=2, anti_snipe=4) as server:
+        # A TCP read can end inside a message or include several commands.
+        # Join in two writes and put a status request after the second half.
+        with socket.create_connection(("127.0.0.1", server.port), timeout=3) as sock:
+            with sock.makefile("rb") as replies:
+                sock.sendall(b'{"type":"jo')
+                sock.sendall(b'in","nick":"observer","role":"auctioneer"}\n{"type":"status"}\n')
+                check("split join frame accepted", json.loads(replies.readline())["type"] == "welcome")
+                states = 0
+                while states < 2:
+                    states += json.loads(replies.readline())["type"] == "state"
+                check("join snapshot and coalesced status both delivered", states == 2)
+
+        players = [Probe(server.port, name) for name in ("north", "south")]
+        try:
+            starts = [p.wait_type("item_start") for p in players]
+            gate = threading.Barrier(2)
+            def offer(player):
+                """Wait for the other bidder so both compete for the same price."""
+                gate.wait(timeout=2)
+                player.client.bid(25, 1)
+            threads = [threading.Thread(target=offer, args=(p,)) for p in players]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            results = [p.wait(lambda m: m["type"] in ("bid_accepted", "bid_rejected")) for p in players]
+            check("equal-price race produces one acceptance and one rejection",
+                  sorted(r["type"] for r in results if r) == ["bid_accepted", "bid_rejected"])
+            for i, reply in enumerate(results):
+                if reply and reply["type"] == "bid_accepted":
+                    seen = players[1-i].wait_type("new_high_bid")
+                    check("bidder and observer receive identical committed state",
+                          seen and all(reply[k] == seen[k] for k in ("amount", "seq", "auction_id", "ends_in")))
+                    check("both clients see the anti-sniping extension", seen and seen["ends_in"] > starts[i]["ends_in"])
+            late = Probe(server.port, "late")
+            try:
+                state = late.wait_type("state")
+                check("late join recovers the winning bid and round sequence",
+                      state and state["seq"] == 1 and state["high_bid"] == 25
+                      and state["auction_id"] == starts[0]["auction_id"])
+            finally:
+                late.client.close()
+        finally:
+            for player in players:
+                player.client.close()
+
+
 def test_robustness():
     """Group 2: crashes, garbage and oversized input do not hurt the server."""
     print("\n== 2. Robustness ==")
@@ -489,6 +539,7 @@ def main():
     args = ap.parse_args()
 
     test_functionality()
+    test_stream_and_contention()
     test_robustness()
     test_keepalive()
     test_auctioneer()
